@@ -6,57 +6,137 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   build-android:
+    name: Android oluştur
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Kaynak kodu al
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Java 17 kur
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Flutter
+      - name: Flutter kur
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.47.4'
           channel: stable
           cache: true
 
-      - name: Generate Android platform
+      - name: Uygulama klasörünü bul
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf /tmp/elxvro_flutter_shell
-          mkdir -p /tmp/elxvro_flutter_shell
-          cd /tmp/elxvro_flutter_shell
-          flutter create --platforms=android --org com.elxvro --project-name elxvro_testers elxvro_testers
-          rm -rf "$GITHUB_WORKSPACE/android"
-          cp -R /tmp/elxvro_flutter_shell/elxvro_testers/android "$GITHUB_WORKSPACE/android"
-          cd "$GITHUB_WORKSPACE"
-          python3 scripts/prepare_android.py
 
-      - name: Validate signing secrets
-        shell: bash
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          for value in "$KEYSTORE_B64" "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD"; do
-            if [ -z "$value" ]; then
-              echo "Eksik Android imzalama secret'i var. README içindeki dört GitHub Secret değerini ekleyin."
+          if [ -f "$GITHUB_WORKSPACE/pubspec.yaml" ]; then
+            APP_DIR="$GITHUB_WORKSPACE"
+          elif [ -f "$GITHUB_WORKSPACE/elxvro_testers_project/pubspec.yaml" ]; then
+            APP_DIR="$GITHUB_WORKSPACE/elxvro_testers_project"
+          else
+            ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \( -iname 'ELXVRO-Testers*.zip' -o -iname '*testers*.zip' \) | head -n 1 || true)"
+            if [ -z "$ZIP_FILE" ]; then
+              echo "pubspec.yaml bulunamadı. Proje dosyalarını repo köküne veya elxvro_testers_project klasörüne yükleyin."
               exit 1
             fi
-          done
 
-      - name: Configure release signing
+            rm -rf "$RUNNER_TEMP/elxvro_source"
+            mkdir -p "$RUNNER_TEMP/elxvro_source"
+            unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/elxvro_source"
+
+            PUBSPEC="$(find "$RUNNER_TEMP/elxvro_source" -type f -name pubspec.yaml | head -n 1 || true)"
+            if [ -z "$PUBSPEC" ]; then
+              echo "ZIP içinde pubspec.yaml bulunamadı."
+              exit 1
+            fi
+            APP_DIR="$(dirname "$PUBSPEC")"
+          fi
+
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Flutter proje klasörü: $APP_DIR"
+          ls -la "$APP_DIR"
+
+      - name: Android platformunu oluştur
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+
+          rm -rf "$RUNNER_TEMP/elxvro_flutter_shell"
+          mkdir -p "$RUNNER_TEMP/elxvro_flutter_shell"
+          cd "$RUNNER_TEMP/elxvro_flutter_shell"
+          flutter create --platforms=android --org com.elxvro --project-name elxvro_testers elxvro_testers
+
+          rm -rf "$APP_DIR/android"
+          cp -R "$RUNNER_TEMP/elxvro_flutter_shell/elxvro_testers/android" "$APP_DIR/android"
+          cd "$APP_DIR"
+
+          if [ -f scripts/prepare_android.py ]; then
+            python3 scripts/prepare_android.py
+          else
+            echo "prepare_android.py yok; gerekli Android ayarları workflow içinde uygulanıyor."
+            python3 - <<'PY'
+          from pathlib import Path
+
+          gradle = Path('android/app/build.gradle.kts')
+          if not gradle.exists():
+              raise SystemExit('android/app/build.gradle.kts bulunamadı.')
+
+          text = gradle.read_text(encoding='utf-8')
+
+          if 'import java.util.Properties' not in text:
+              text = 'import java.util.Properties\nimport java.io.FileInputStream\n\n' + text
+
+          if 'val keystoreProperties = Properties()' not in text:
+              props = '''val keystoreProperties = Properties()\nval keystorePropertiesFile = rootProject.file("key.properties")\nif (keystorePropertiesFile.exists()) {\n    keystoreProperties.load(FileInputStream(keystorePropertiesFile))\n}\n\n'''
+              text = text.replace('android {', props + 'android {', 1)
+
+          # Flutter'ın ürettiği varsayılan kimliği ELXVRO paket kimliğine çevir.
+          import re
+          text = re.sub(r'namespace\s*=\s*"[^"]+"', 'namespace = "com.elxvro.testers"', text, count=1)
+          text = re.sub(r'applicationId\s*=\s*"[^"]+"', 'applicationId = "com.elxvro.testers"', text, count=1)
+
+          if 'create("release")' not in text:
+              signing = '''    signingConfigs {\n        if (keystorePropertiesFile.exists()) {\n            create("release") {\n                keyAlias = keystoreProperties["keyAlias"] as String\n                keyPassword = keystoreProperties["keyPassword"] as String\n                storeFile = file(keystoreProperties["storeFile"] as String)\n                storePassword = keystoreProperties["storePassword"] as String\n            }\n        }\n    }\n\n'''
+              text = text.replace('    buildTypes {', signing + '    buildTypes {', 1)
+
+          text = text.replace(
+              'signingConfig = signingConfigs.getByName("debug")',
+              'signingConfig = if (keystorePropertiesFile.exists()) signingConfigs.getByName("release") else signingConfigs.getByName("debug")'
+          )
+          gradle.write_text(text, encoding='utf-8')
+
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          if manifest.exists():
+              m = manifest.read_text(encoding='utf-8')
+              m = re.sub(r'android:label="[^"]+"', 'android:label="ELXVRO Testers"', m, count=1)
+              manifest.write_text(m, encoding='utf-8')
+
+          # MainActivity paket yolunu ve package satırını düzelt.
+          kotlin_root = Path('android/app/src/main/kotlin')
+          activities = list(kotlin_root.rglob('MainActivity.kt')) if kotlin_root.exists() else []
+          if activities:
+              old = activities[0]
+              new = kotlin_root / 'com/elxvro/testers/MainActivity.kt'
+              source = old.read_text(encoding='utf-8')
+              source = re.sub(r'^package\s+[^\n]+', 'package com.elxvro.testers', source, count=1, flags=re.M)
+              new.parent.mkdir(parents=True, exist_ok=True)
+              new.write_text(source, encoding='utf-8')
+              if old.resolve() != new.resolve():
+                  old.unlink()
+
+          print('Android paket kimliği ve release signing ayarları hazırlandı.')
+          PY
+          fi
+
+      - name: İmzalama sırlarını doğrula
         shell: bash
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -65,6 +145,29 @@ jobs:
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          missing=0
+          for name in KEYSTORE_B64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "Eksik secret: $name"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "GitHub > Settings > Secrets and variables > Actions bölümündeki Android imzalama secret'larını ekleyin."
+            exit 1
+          fi
+
+      - name: Sürüm imzalamasını yapılandır
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+
           printf '%s' "$KEYSTORE_B64" | base64 --decode > android/app/elxvro-release.jks
           cat > android/key.properties <<EOF
           storePassword=$STORE_PASSWORD
@@ -73,49 +176,63 @@ jobs:
           storeFile=elxvro-release.jks
           EOF
 
-      - name: Flutter packages
-        run: flutter pub get
+      - name: Paketleri indir
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          flutter pub get
 
-      - name: Analyze
-        run: flutter analyze
+      - name: Kod analizi
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          flutter analyze
 
-      - name: Test
-        run: flutter test
+      - name: Testleri çalıştır
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          flutter test
 
-      - name: Build signed AAB
+      - name: Release AAB oluştur
         shell: bash
         env:
           API_BASE_URL: ${{ vars.API_BASE_URL }}
         run: |
           set -euo pipefail
+          cd "$APP_DIR"
           if [ -n "${API_BASE_URL:-}" ]; then
             flutter build appbundle --release --dart-define="API_BASE_URL=$API_BASE_URL"
           else
             flutter build appbundle --release
           fi
 
-      - name: Build signed APK
+      - name: Release APK oluştur
         shell: bash
         env:
           API_BASE_URL: ${{ vars.API_BASE_URL }}
         run: |
           set -euo pipefail
+          cd "$APP_DIR"
           if [ -n "${API_BASE_URL:-}" ]; then
             flutter build apk --release --dart-define="API_BASE_URL=$API_BASE_URL"
           else
             flutter build apk --release
           fi
 
-      - name: Upload AAB
+      - name: AAB yükle
         uses: actions/upload-artifact@v4
         with:
           name: elxvro-testers-aab
-          path: build/app/outputs/bundle/release/app-release.aab
+          path: ${{ env.APP_DIR }}/build/app/outputs/bundle/release/app-release.aab
           if-no-files-found: error
 
-      - name: Upload APK
+      - name: APK yükle
         uses: actions/upload-artifact@v4
         with:
           name: elxvro-testers-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: ${{ env.APP_DIR }}/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
